@@ -1,0 +1,485 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+# 2214beff470a3acb486b56400c032bc3acdc3a7d
+# rds cluster that can be queried by a lambda
+
+# 46bb42284703f204bdbe2381cfba07610d2bec2c
+# rds cluster with api & lambda
+
+# d3792d10402b12e17f4c88566866cc19e768c0f2
+# WORKING
+
+# 5535974f0f22c8b34426ca2181c08a3787c12917
+# more restrictive vpc endpoint policy
+
+# c7af6c19fb2afdabcff681a871c776f4df6cb54a
+# private subnets attached to NACL
+
+Parameters:
+  vpcCIDR:
+    Type: String
+    Description: cidr block for the vpc
+    Default: 10.10.0.0/16
+  RDSusername:
+    Type: String
+    Description: username for the cluster
+    Default: admin
+  RDSpassword:
+    Type: String
+    Description: password for the cluster
+    Default: password
+  RDSdatabaseName:
+    Type: String
+    Description: name of the initial db in the cluster
+    Default: db
+  
+Globals:
+  Function:
+    CodeUri: ./
+    Runtime: nodejs18.x
+    MemorySize: 3008
+    Timeout: 900
+    Environment:
+      Variables:
+        DATABASE_ARN: !GetAtt RDSCluster.DBClusterArn
+        DATABASE_SECRET: !Ref RDSDBSecret
+        DATABASE_NAME: !Ref RDSdatabaseName
+  
+Resources:
+############## LAMBDA ROLES ####################
+  RDSFunctionRole: #This determines what can be done inside the EC2 instance
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-rds-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "rds-db:connect"
+                Resource: !GetAtt RDSCluster.DBClusterArn
+              - Effect: Allow
+                Action: "rds-data:ExecuteStatement"
+                Resource: !GetAtt RDSCluster.DBClusterArn
+              - Effect: Allow
+                Action: "secretsmanager:GetSecretValue"
+                Resource: !Ref RDSDBSecret
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+  
+  ApiIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-api-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  
+############## LAMBDA FUNCTION ####################
+  
+  RDSqueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-RDSqueryFunction"
+      Role: !GetAtt RDSFunctionRole.Arn
+      Handler: src/index.handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref publicLambdaSecurityGroup
+        SubnetIds:
+          - !Ref publicSubnetA
+          - !Ref publicSubnetB
+          - !Ref publicSubnetC
+  
+  RDSqueryFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/lambda/', !Select [6, !Split [':', !GetAtt RDSqueryFunction.Arn]]]]
+    DeletionPolicy: Delete
+  
+############## API RESOURCES ####################
+  
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      #StageName: !Ref StageName
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+      FailOnWarnings: true
+  
+  apiProdAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/api-gatewayV2/', !Sub "${AWS::StackName}-AccessLogs"]]
+  
+  queryIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref HttpApi
+      CredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt RDSqueryFunction.Arn
+          - /invocations
+      PayloadFormatVersion: '2.0'
+
+  queryRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      OperationName: !Sub "${AWS::StackName}-queryRoute"
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /CustomerId/{customerId}'
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref queryIntegration
+  
+############## NETWORK RESOURCES ####################
+  
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-InternetGateway"
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref RDSvpc
+  
+############## NETWORK ACL RESOURCES ####################
+  
+  networkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref RDSvpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-networkAcl"
+  
+  ACLInboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: false # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  ACLOutboundRule:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref networkAcl
+      RuleNumber: 100
+      Egress: true # outgoing
+      Protocol: -1 # according to this list https://en.wikipedia.org/wiki/List_of_IP_protocol_numbers
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+  
+  publicSubnetANetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetA
+      NetworkAclId: !Ref networkAcl
+  
+  publicSubnetBNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetB
+      NetworkAclId: !Ref networkAcl
+  
+  publicSubnetCNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetC
+      NetworkAclId: !Ref networkAcl
+  
+  privateSubnetANetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetA
+      NetworkAclId: !Ref networkAcl
+  
+  privateSubnetBNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetB
+      NetworkAclId: !Ref networkAcl
+  
+  privateSubnetCNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref privateSubnetC
+      NetworkAclId: !Ref networkAcl
+  
+#########################################################
+    
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref RDSvpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRouteTable"
+  
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+    DependsOn:
+      - VPCGatewayAttachment
+  
+  publicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetA
+  
+  publicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetB
+  
+  publicSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref publicSubnetC
+  
+  RDSvpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref vpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+  
+  publicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [0, !Cidr [ !GetAtt RDSvpc.CidrBlock, 6, 8 ]] # 10.10.0.0/24
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref RDSvpc
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetA"
+    
+  publicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [1, !Cidr [ !GetAtt RDSvpc.CidrBlock, 6, 8 ]] # 10.10.1.0/24
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref RDSvpc
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetB"
+  
+  publicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [2, !Cidr [ !GetAtt RDSvpc.CidrBlock, 6, 8 ]] # 10.10.2.0/24
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref RDSvpc
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicSubnetC"
+  
+  privateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [3, !Cidr [ !GetAtt RDSvpc.CidrBlock, 6, 8 ]] # 10.10.3.0/24
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref RDSvpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetA"
+  
+  privateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [4, !Cidr [ !GetAtt RDSvpc.CidrBlock, 6, 8 ]] # 10.10.4.0/24
+      AvailabilityZone: !Select [1, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref RDSvpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetB"
+  
+  privateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Select [5, !Cidr [ !GetAtt RDSvpc.CidrBlock, 6, 8 ]] # 10.10.5.0/24
+      AvailabilityZone: !Select [2, Fn::GetAZs: !Ref "AWS::Region"]
+      VpcId: !Ref RDSvpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateSubnetC"
+  
+  publicLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub "${AWS::StackName}-publicLambdaSecurityGroup description"
+      GroupName: !Sub "${AWS::StackName}-publicLambdaSecurityGroup"
+      VpcId: !Ref RDSvpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80 #HTTP Endpoint
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443 #HTTPS Endpoint
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-publicLambdaSecurityGroup"
+  
+  privateRDSsecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: !Sub "${AWS::StackName}-privateRDSsecurityGroup description"
+      GroupName: !Sub "${AWS::StackName}-privateRDSsecurityGroup"
+      VpcId: !Ref RDSvpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80 #HTTP Endpoint
+          ToPort: 80
+          SourceSecurityGroupId: !Ref publicLambdaSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443 #HTTPS Endpoint
+          ToPort: 443
+          SourceSecurityGroupId: !Ref publicLambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-privateRDSsecurityGroup"
+  
+  rdsDataVPCendpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'rds-data:ExecuteStatement'
+            Resource: '*'
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !Ref publicLambdaSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.rds-data'
+      SubnetIds: 
+        - !Ref publicSubnetA
+        - !Ref publicSubnetB
+        - !Ref publicSubnetC
+      VpcEndpointType: Interface
+      VpcId: !Ref RDSvpc
+  
+############## RDS RESOURCES ####################
+  
+  RDSCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      AvailabilityZones:
+        - !GetAtt publicSubnetA.AvailabilityZone
+        - !GetAtt publicSubnetB.AvailabilityZone
+        - !GetAtt publicSubnetC.AvailabilityZone
+      DatabaseName: testdb
+      DatabaseName: !Ref RDSdatabaseName
+      Engine: aurora-mysql
+      EngineMode: serverless
+      #EngineVersion: 5.6.mysql_aurora.1.23.4
+      MasterUsername: !Ref RDSusername
+      MasterUserPassword: !Ref RDSpassword
+      ScalingConfiguration:
+        AutoPause: false #pause when there are no instances - saves cost
+        MaxCapacity: 4
+        MinCapacity: 1
+        #SecondsUntilAutoPause: 300 #minimum of 300
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref privateRDSsecurityGroup
+      EnableHttpEndpoint: true #exposes HTTP endpoint that query requests can be made to
+      MasterUserSecret: #The cluster would create its own secret - this replaces that with our own
+        SecretArn: !Ref RDSDBSecret
+  
+  RDSClusterLogGroup: # gets auto created
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/rds/cluster/', !Ref RDSCluster]]
+    DeletionPolicy: Delete
+  
+  #RDSClusterLogGroup: # created while cluster is created - this will casue an error
+  #  Type: AWS::Logs::LogGroup
+  #  Properties:
+  #    LogGroupName: !Join ['', ['/aws/rds/cluster/', !Ref RDSCluster, '/error']]
+  #  DeletionPolicy: Delete
+  
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${AWS::StackName}-DBSubnetGroup"
+      DBSubnetGroupDescription: "Subnets for RDS"
+      SubnetIds:
+        - !Ref privateSubnetA
+        - !Ref privateSubnetB
+        - !Ref privateSubnetC
+  
+############## RDS SECRET ####################
+  
+  RDSDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-db-secret"
+      Description: "Credentials for RDS instance"
+      SecretString: !Sub '{"username": "${RDSusername}", "password": "${RDSpassword}"}'
+  
+Outputs:
+  HttpApiUrl:
+    Description: GET endpoint for customerIds
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/CustomerId/123'
+  RDSDBSecretArn:
+    Value: !Ref RDSDBSecret

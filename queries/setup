@@ -1,0 +1,15 @@
+query editor
+database username: enter secret key
+enter database name 'db'
+terminator ;
+
+CREATE TABLE Customers (
+  CustomerId int,
+  FirstName varchar(255)
+)
+
+INSERT INTO Customers (CustomerId, FirstName) VALUES (100, 'Name');
+INSERT INTO Customers (CustomerId, FirstName) VALUES (101, 'Name1');
+INSERT INTO Customers (CustomerId, FirstName) VALUES (102, 'Name2');
+
+SELECT * from Customers;
