@@ -260,6 +260,14 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-PublicRouteTable"
   
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref RDSvpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRouteTable"
+  
   PublicRoute:
     Type: AWS::EC2::Route
     Properties:
@@ -286,6 +294,24 @@ Resources:
     Properties:
       RouteTableId: !Ref PublicRouteTable
       SubnetId: !Ref publicSubnetC
+  
+  privateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref privateSubnetA
+  
+  privateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref privateSubnetB
+  
+  privateSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref privateSubnetC
   
   RDSvpc:
     Type: AWS::EC2::VPC
